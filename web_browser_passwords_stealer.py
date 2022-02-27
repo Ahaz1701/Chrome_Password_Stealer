@@ -6,11 +6,16 @@ import base64
 import shutil
 import sqlite3
 from Crypto.Cipher import AES
-import win32crypt
+from Crypto.Protocol import KDF
+try:
+    import win32crypt
+except:
+    pass
+import subprocess
 from contextlib import closing
 
 file = "chrome_passwords.txt"  # File to store Chrome plain passwords
-file2 = "Loginvault.db"  # File to store Chrome encrypted passwords
+file2 = "chrome_login.db"  # File to store Chrome encrypted passwords
 
 OS = [
     {
@@ -23,9 +28,10 @@ OS = [
         }
     },
     {
-        "Mac": {
+        "Darwin": {
             "Chrome": {
-                "basepath": "~/Library/Application Support/Google/Chrome/(Default|{PROFILE})/Login Data",
+                "basepath": os.path.join(os.path.expanduser("~"), "Library/Application Support/Google/Chrome"),
+                "passwords_path": "Default/Login Data"
             }
         }
     },
@@ -34,24 +40,30 @@ OS = [
 
 def get_secret_key():
     os_name = platform.system()
-    for system in OS:
+
+    if os_name == "Windows":
+        system = OS[0]
+        file = os.path.join(system[os_name]["Chrome"]["basepath"], system[os_name]["Chrome"]["key_path"])
+        with open(file, "r", encoding="latin1") as f:
+            secret_key = base64.b64decode(json.load(f)["os_crypt"]["encrypted_key"])[5:]
+            secret_key = win32crypt.CryptUnprotectData(secret_key, None, None, None, 0)[1]
+    
+    elif os_name == "Darwin":
         try:
-            file = os.path.join(
-                system[os_name]["Chrome"]["basepath"], system[os_name]["Chrome"]["key_path"])
-            with open(file, "r", encoding="latin1") as f:
-                secret_key = base64.b64decode(
-                    json.load(f)["os_crypt"]["encrypted_key"])[5:]
-                secret_key = win32crypt.CryptUnprotectData(
-                    secret_key, None, None, None, 0)[1]
-            return secret_key, system[os_name]["Chrome"]
+            system = OS[1]
+            secret_key = subprocess.check_output("security find-generic-password -wa 'Chrome'", shell=True).replace(b"\n", b"")
+            secret_key = KDF.PBKDF2(secret_key, b"saltysalt", 16, 1003)
         except:
-            pass
-    sys.exit("Your OS is not supported!")
+            sys.exit("The user didn't allow access to Chrome Storage Key!")
+    
+    else:
+        sys.exit("Your OS is not supported!")
+    return secret_key, system, os_name
 
 
-def decrypt_passwords(secret_key, system):
+def decrypt_passwords(secret_key, system, os_name):
     shutil.copy2(os.path.join(
-        system["basepath"], system["passwords_path"]), file2)
+        system[os_name]["Chrome"]["basepath"], system[os_name]["Chrome"]["passwords_path"]), file2)
 
     with closing(sqlite3.connect(file2)) as conn:
         with closing(conn.cursor()) as cursor:
@@ -62,14 +74,21 @@ def decrypt_passwords(secret_key, system):
             for _index, login in enumerate(cursor.fetchall()):
                 if login:
                     decrypted_passwords.append(
-                        {"Hostname": login[0], "Username": login[1], "Password": decrypt(secret_key, login[2])})
+                        {"Hostname": login[0], "Username": login[1], "Password": decrypt(secret_key, login[2], system)})
     return decrypted_passwords
 
 
-def decrypt(secret_key, cipher_text):
-    initialization_vector = cipher_text[3:15]
-    encrypted_password = cipher_text[15:-16]
-    cipher = AES.new(secret_key, AES.MODE_GCM, initialization_vector)
+def decrypt(secret_key, cipher_text, system):
+    if list(system.keys())[0] == "Windows":
+        initialization_vector = cipher_text[3:15]
+        encrypted_password = cipher_text[15:-16]
+        cipher = AES.new(secret_key, AES.MODE_GCM, initialization_vector)
+
+    elif list(system.keys())[0] == "Darwin":
+        initialization_vector = b" " * 16
+        encrypted_password = cipher_text[3:]
+        cipher = AES.new(secret_key, AES.MODE_CBC, initialization_vector)
+
     decrypted_password = cipher.decrypt(encrypted_password).decode("latin1")
     return decrypted_password
 
@@ -93,8 +112,8 @@ def store_plain_data(decrypted_data):
 
 
 if __name__ == "__main__":
-    secret_key, system = get_secret_key()
-    decrypted_passwords = decrypt_passwords(secret_key, system)
+    secret_key, system, os_name = get_secret_key()
+    decrypted_passwords = decrypt_passwords(secret_key, system, os_name)
     display_plain_data(decrypted_passwords)
     store_plain_data(decrypted_passwords)
 
